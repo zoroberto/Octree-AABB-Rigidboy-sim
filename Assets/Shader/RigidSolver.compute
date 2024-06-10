@@ -1,0 +1,465 @@
+﻿//uniform data here
+uint nodeCount;
+uint triCount;
+uint numberObj;
+bool debug;
+
+float dt;
+float invMass;
+
+struct vertData
+{
+    float3 pos;
+    float2 uvs;
+    float3 norms;
+};
+struct Triangle
+{
+    uint v0;
+    uint v1;
+    uint v2;
+};
+
+struct BoundingBox
+{
+    float3 min;
+    float3 max;
+};
+
+struct Tri
+{
+    float3 vertex0;
+    float3 vertex1;
+    float3 vertex2;
+};
+
+struct OctreeData
+{
+    float3 min;
+    float3 max;
+    float3 center;
+};
+
+struct PairIndex
+{
+    uint i1;
+    uint i2;
+};
+
+// Update pos and vel
+RWStructuredBuffer<float3> Positions;
+RWStructuredBuffer<float3> Velocities;
+
+// vertices normal
+RWStructuredBuffer<vertData> vertsBuff;
+RWStructuredBuffer<Triangle> Triangles;
+RWStructuredBuffer<uint> TrianglePtr;
+
+// floor min and max
+RWStructuredBuffer<float3> floorPositions;
+RWStructuredBuffer<BoundingBox> floorBB;
+
+// BB min and max
+RWStructuredBuffer<BoundingBox> bbMinMax;
+StructuredBuffer<int2> ObjectIndex;
+RWStructuredBuffer<uint> floorCollisionResults;
+
+// Octree Data
+RWStructuredBuffer<OctreeData> bbOctree;
+RWStructuredBuffer<PairIndex> pairIndexLv2;
+RWStructuredBuffer<uint> collisionResults;
+
+#pragma kernel computeVerticesNormal
+#pragma kernel UpdatePosKernel
+#pragma kernel FindFloorMinMax
+#pragma kernel FindBBMinMax
+#pragma kernel UpdateReverseVelocity
+#pragma kernel ImplementOctree
+#pragma kernel CheckCollisionOctree
+
+[numthreads(1024, 1, 1)]
+void computeVerticesNormal(uint3 i : SV_DispatchThreadID) {
+    if (i.x >= nodeCount) return;
+
+    float3 norm = float3(0, 0, 0);
+    uint start = TrianglePtr[i.x];
+    uint end = TrianglePtr[i.x + 1];
+
+    for (uint j = start; j < end; j++) {
+        Triangle t = Triangles[j];
+        float3 v1 = Positions[t.v0];
+        float3 v2 = Positions[t.v1];
+        float3 v3 = Positions[t.v2];
+
+        float3 N = cross(v2 - v1, v3 - v1);
+        norm += N;
+    }
+    vertsBuff[i.x].norms = normalize(norm);
+}
+
+[numthreads(1024, 1, 1)]
+void UpdatePosKernel(uint3 i : SV_DispatchThreadID) {
+    if (i.x >= nodeCount) return;
+
+    float3 gravity = float3(0.0f, -9.81f, 0.0f);
+    float3 position = Positions[i.x];
+    float3 velocity = Velocities[i.x];
+
+    velocity = velocity + gravity * invMass * dt;
+    position = position + velocity * dt;
+    Positions[i.x] = position;
+    Velocities[i.x] = velocity;
+
+    vertsBuff[i.x].pos = Positions[i.x];
+}
+
+
+[numthreads(1, 1, 1)]
+void FindFloorMinMax(uint3 i : SV_DispatchThreadID)
+{
+    uint idx = i.x;
+
+    float3 minValue = floorPositions[0];
+    float3 maxValue = floorPositions[0];
+
+    for (uint i = 0; i < floorPositions.Length; i++)
+    {
+        float3 vertex = floorPositions[i];
+
+        minValue = min(minValue, vertex); // 최소값 업데이트
+        maxValue = max(maxValue, vertex); // 최대값 업데이트
+    }
+    maxValue.y += 0.1f;
+
+    floorBB[idx].min = minValue;
+    floorBB[idx].max = maxValue;
+}
+
+[numthreads(1024, 1, 1)]
+void FindBBMinMax(uint3 i : SV_DispatchThreadID)
+{
+    uint idx = i.x;
+
+    if (idx >= numberObj) return;
+
+    uint start = ObjectIndex[idx].x;
+    uint end = ObjectIndex[idx].y; 
+
+    float3 min_value = Positions[start]; // 0 24
+    float3 max_value = Positions[start]; // 0 24
+
+    for (uint i = start; i < end; i++) // 0 < 24
+    {
+        float3 vertex = Positions[i];
+
+        min_value = min(min_value, vertex); // 최소값 업데이트
+        max_value = max(max_value, vertex); // 최대값 업데이트
+    }
+
+    bbMinMax[idx].min = min_value;
+    bbMinMax[idx].max = max_value;
+
+    bool collides =
+    bbMinMax[idx].min.x <= floorBB[0].max.x &&
+    bbMinMax[idx].max.x >= floorBB[0].min.x &&
+    bbMinMax[idx].min.y <= floorBB[0].max.y &&
+    bbMinMax[idx].max.y >= floorBB[0].min.y &&
+    bbMinMax[idx].min.z <= floorBB[0].max.z &&
+    bbMinMax[idx].max.z >= floorBB[0].min.z;
+
+    floorCollisionResults[idx] = collides ? 1 : 0;
+}
+
+
+[numthreads(1024, 1, 1)]
+void UpdateReverseVelocity(uint3 i : SV_DispatchThreadID)
+{
+    uint idx = i.x;
+
+    if (idx >= nodeCount) return;
+    
+    for (uint j = 0; j < numberObj; j++) {
+        if (floorCollisionResults[j] == 1) {
+            uint start = ObjectIndex[j].x;
+            uint end = ObjectIndex[j].y; 
+            // float penetrationPos = 0;
+            
+            if (idx >= start && idx < end) {
+                
+                Velocities[idx] *= -1;
+                Positions[idx].y += 0.1f;
+            }
+        }
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void ImplementOctree(uint3 i : SV_DispatchThreadID)
+{
+    uint idx = i.x;
+
+    if (idx >= numberObj ) return;
+
+    // Lv0, Initialize Lv0 
+    bbOctree[idx * 73].center = (bbMinMax[idx].max + bbMinMax[idx].min) / 2;
+    bbOctree[idx * 73].min = bbMinMax[idx].min; // min value Lv0
+    bbOctree[idx * 73].max = bbMinMax[idx].max; // max value Lv0
+
+    float3 center = bbOctree[idx * 73].center;
+    float3 size = bbOctree[idx * 73].max - bbOctree[idx * 73].min;
+
+    // Lv1, Split to 8 children
+    bbOctree[idx * 73 + 1].center.x = center.x - (size.x / 4);
+    bbOctree[idx * 73 + 1].center.y = center.y + (size.y / 4);
+    bbOctree[idx * 73 + 1].center.z = center.z - (size.z / 4);
+
+    bbOctree[idx * 73 + 2].center.x = center.x + (size.x / 4);
+    bbOctree[idx * 73 + 2].center.y = center.y + (size.y / 4);
+    bbOctree[idx * 73 + 2].center.z = center.z - (size.z / 4);
+
+    bbOctree[idx * 73 + 3].center.x = center.x - (size.x / 4);
+    bbOctree[idx * 73 + 3].center.y = center.y - (size.y / 4);
+    bbOctree[idx * 73 + 3].center.z = center.z - (size.z / 4);
+
+    bbOctree[idx * 73 + 4].center.x = center.x + (size.x / 4);
+    bbOctree[idx * 73 + 4].center.y = center.y - (size.y / 4);
+    bbOctree[idx * 73 + 4].center.z = center.z - (size.z / 4);
+
+    bbOctree[idx * 73 + 5].center.x = center.x - (size.x / 4);
+    bbOctree[idx * 73 + 5].center.y = center.y + (size.y / 4);
+    bbOctree[idx * 73 + 5].center.z = center.z + (size.z / 4);
+
+    bbOctree[idx * 73 + 6].center.x = center.x + (size.x / 4);
+    bbOctree[idx * 73 + 6].center.y = center.y + (size.y / 4);
+    bbOctree[idx * 73 + 6].center.z = center.z + (size.z / 4);
+
+    bbOctree[idx * 73 + 7].center.x = center.x - (size.x / 4);
+    bbOctree[idx * 73 + 7].center.y = center.y - (size.y / 4);
+    bbOctree[idx * 73 + 7].center.z = center.z + (size.z / 4);
+
+    bbOctree[idx * 73 + 8].center.x = center.x + (size.x / 4);
+    bbOctree[idx * 73 + 8].center.y = center.y - (size.y / 4);
+    bbOctree[idx * 73 + 8].center.z = center.z + (size.z / 4);
+
+    for (uint j = 1; j <= 8; j++)
+    {
+        // Lv1, min and max
+        bbOctree[idx * 73 + j].min.x = bbOctree[idx * 73 + j].center.x - (size.x / 4);
+        bbOctree[idx * 73 + j].min.y = bbOctree[idx * 73 + j].center.y - (size.y / 4);
+        bbOctree[idx * 73 + j].min.z = bbOctree[idx * 73 + j].center.z - (size.z / 4);
+
+        bbOctree[idx * 73 + j].max.x = bbOctree[idx * 73 + j].center.x + (size.x / 4);
+        bbOctree[idx * 73 + j].max.y = bbOctree[idx * 73 + j].center.y + (size.y / 4);
+        bbOctree[idx * 73 + j].max.z = bbOctree[idx * 73 + j].center.z + (size.z / 4);
+
+        // Lv2, Split to 64 children
+        bbOctree[idx * 73 + j * 8 + 1].center.x = bbOctree[idx * 73 + j].center.x - (size.x / 8);
+        bbOctree[idx * 73 + j * 8 + 1].center.y = bbOctree[idx * 73 + j].center.y + (size.y / 8);
+        bbOctree[idx * 73 + j * 8 + 1].center.z = bbOctree[idx * 73 + j].center.z - (size.z / 8);
+                                                  
+        bbOctree[idx * 73 + j * 8 + 2].center.x = bbOctree[idx * 73 + j].center.x + (size.x / 8);
+        bbOctree[idx * 73 + j * 8 + 2].center.y = bbOctree[idx * 73 + j].center.y + (size.y / 8);
+        bbOctree[idx * 73 + j * 8 + 2].center.z = bbOctree[idx * 73 + j].center.z - (size.z / 8);
+                                              
+        bbOctree[idx * 73 + j * 8 + 3].center.x = bbOctree[idx * 73 + j].center.x - (size.x / 8);
+        bbOctree[idx * 73 + j * 8 + 3].center.y = bbOctree[idx * 73 + j].center.y - (size.y / 8);
+        bbOctree[idx * 73 + j * 8 + 3].center.z = bbOctree[idx * 73 + j].center.z - (size.z / 8);
+                                                 
+        bbOctree[idx * 73 + j * 8 + 4].center.x = bbOctree[idx * 73 + j].center.x + (size.x / 8);
+        bbOctree[idx * 73 + j * 8 + 4].center.y = bbOctree[idx * 73 + j].center.y - (size.y / 8);
+        bbOctree[idx * 73 + j * 8 + 4].center.z = bbOctree[idx * 73 + j].center.z - (size.z / 8);
+                                              
+        bbOctree[idx * 73 + j * 8 + 5].center.x = bbOctree[idx * 73 + j].center.x - (size.x / 8);
+        bbOctree[idx * 73 + j * 8 + 5].center.y = bbOctree[idx * 73 + j].center.y + (size.y / 8);
+        bbOctree[idx * 73 + j * 8 + 5].center.z = bbOctree[idx * 73 + j].center.z + (size.z / 8);
+                                             
+        bbOctree[idx * 73 + j * 8 + 6].center.x = bbOctree[idx * 73 + j].center.x + (size.x / 8);
+        bbOctree[idx * 73 + j * 8 + 6].center.y = bbOctree[idx * 73 + j].center.y + (size.y / 8);
+        bbOctree[idx * 73 + j * 8 + 6].center.z = bbOctree[idx * 73 + j].center.z + (size.z / 8);
+                                         
+        bbOctree[idx * 73 + j * 8 + 7].center.x = bbOctree[idx * 73 + j].center.x - (size.x / 8);
+        bbOctree[idx * 73 + j * 8 + 7].center.y = bbOctree[idx * 73 + j].center.y - (size.y / 8);
+        bbOctree[idx * 73 + j * 8 + 7].center.z = bbOctree[idx * 73 + j].center.z + (size.z / 8);
+                                           
+        bbOctree[idx * 73 + j * 8 + 8].center.x = bbOctree[idx * 73 + j].center.x + (size.x / 8);
+        bbOctree[idx * 73 + j * 8 + 8].center.y = bbOctree[idx * 73 + j].center.y - (size.y / 8);
+        bbOctree[idx * 73 + j * 8 + 8].center.z = bbOctree[idx * 73 + j].center.z + (size.z / 8);
+
+        for (uint k = 1; k <= 8; k++)
+        {
+            // Lv2, min and max
+            bbOctree[idx * 73 + j * 8 + k].min.x = bbOctree[idx * 73 + j * 8 + k].center.x - (size.x / 8);
+            bbOctree[idx * 73 + j * 8 + k].min.y = bbOctree[idx * 73 + j * 8 + k].center.y - (size.y / 8);
+            bbOctree[idx * 73 + j * 8 + k].min.z = bbOctree[idx * 73 + j * 8 + k].center.z - (size.z / 8);
+                                                                                                 
+            bbOctree[idx * 73 + j * 8 + k].max.x = bbOctree[idx * 73 + j * 8 + k].center.x + (size.x / 8);
+            bbOctree[idx * 73 + j * 8 + k].max.y = bbOctree[idx * 73 + j * 8 + k].center.y + (size.y / 8);
+            bbOctree[idx * 73 + j * 8 + k].max.z = bbOctree[idx * 73 + j * 8 + k].center.z + (size.z / 8);
+        }
+    }
+}
+
+#pragma kernel RemoveCollisionResults
+
+[numthreads(1024, 1, 1)]
+void RemoveCollisionResults(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+
+    if(idx >= numberObj * 73) return;
+    collisionResults[idx] = 0;
+}
+
+uint calcIndexObjectLevel0(uint object_index)
+{
+    uint level = floor(float(object_index) / 73.0f);
+
+    if (level != 0) return level * 73;
+    return floor(float(object_index) / 73.0f);
+}
+
+uint calcIndexObjectLevel1(uint object_index)
+{
+    uint level = floor(float(object_index) / 73.0f);
+    
+    if (level == 1) return floor(float((object_index - 1 + level) / 8.0f) + level * 64);
+    if (level == 2) return floor(float((object_index - 1 + level) / 8.0f) + level * 64);
+
+    return floor(float((object_index - 1) / 8) + level * 64);
+}
+
+[numthreads(1024, 1, 1)]
+void CheckCollisionOctree(uint3 i : SV_DispatchThreadID)
+{
+    uint idx = i.x;
+
+    if (idx >= pairIndexLv2.Length) return;
+
+    PairIndex pair = pairIndexLv2[idx];
+    uint i1 = pair.i1;
+    uint i2 = pair.i2;
+
+    uint l0_index_obj1 = calcIndexObjectLevel0(i1);
+    uint l0_index_obj2 = calcIndexObjectLevel0(i2);
+
+    uint l1_index_obj1 = calcIndexObjectLevel1(i1);
+    uint l1_index_obj2 = calcIndexObjectLevel1(i2);
+
+    // create Lv0 obj
+    OctreeData l0_obj1 = bbOctree[l0_index_obj1];
+    OctreeData l0_obj2 = bbOctree[l0_index_obj2];
+    
+    // create Lv1 obj
+    OctreeData l1_obj1 = bbOctree[l1_index_obj1];
+    OctreeData l1_obj2 = bbOctree[l1_index_obj2];
+
+    // create Lv2 obj
+    OctreeData b1 = bbOctree[i1];
+    OctreeData b2 = bbOctree[i2];
+
+    if (!(
+        l0_obj1.min.x <= l0_obj2.max.x &&
+        l0_obj1.max.x >= l0_obj2.min.x &&
+        l0_obj1.min.y <= l0_obj2.max.y &&
+        l0_obj1.max.y >= l0_obj2.min.y &&
+        l0_obj1.min.z <= l0_obj2.max.z &&
+        l0_obj1.max.z >= l0_obj2.min.z))
+    {
+        return;
+    }
+    else
+    {
+        if(debug)
+        {
+            collisionResults[l0_index_obj1] = 1;
+            collisionResults[l0_index_obj2] = 1;
+        }
+    }
+
+    if (!(
+        l1_obj1.min.x <= l1_obj2.max.x &&
+        l1_obj1.max.x >= l1_obj2.min.x &&
+        l1_obj1.min.y <= l1_obj2.max.y &&
+        l1_obj1.max.y >= l1_obj2.min.y &&
+        l1_obj1.min.z <= l1_obj2.max.z &&
+        l1_obj1.max.z >= l1_obj2.min.z))
+    {
+        return;
+    }
+    else
+    {
+        if(debug)
+        {
+            collisionResults[l1_index_obj1] = 1;
+            collisionResults[l1_index_obj2] = 1;
+        }
+    }
+
+    bool collideLv2 =
+    b1.min.x <= b2.max.x &&
+    b1.max.x >= b2.min.x &&
+    b1.min.y <= b2.max.y &&
+    b1.max.y >= b2.min.y &&
+    b1.min.z <= b2.max.z &&
+    b1.max.z >= b2.min.z;
+
+    if(collideLv2)
+    {
+        if(debug)
+        {            
+            collisionResults[i1] = 1;
+            collisionResults[i2] = 1;
+        }
+    }
+
+
+    if ((
+        l0_obj1.min.x <= l0_obj2.max.x &&
+        l0_obj1.max.x >= l0_obj2.min.x &&
+        l0_obj1.min.y <= l0_obj2.max.y &&
+        l0_obj1.max.y >= l0_obj2.min.y &&
+        l0_obj1.min.z <= l0_obj2.max.z &&
+        l0_obj1.max.z >= l0_obj2.min.z))
+    {
+        if(debug)
+        {
+            collisionResults[l0_index_obj1] = 1;
+            collisionResults[l0_index_obj2] = 1;
+        }
+
+        if ((
+            l1_obj1.min.x <= l1_obj2.max.x &&
+            l1_obj1.max.x >= l1_obj2.min.x &&
+            l1_obj1.min.y <= l1_obj2.max.y &&
+            l1_obj1.max.y >= l1_obj2.min.y &&
+            l1_obj1.min.z <= l1_obj2.max.z &&
+            l1_obj1.max.z >= l1_obj2.min.z))
+        {
+            if(debug)
+            {
+                collisionResults[l1_index_obj1] = 1;
+                collisionResults[l1_index_obj2] = 1;
+            }
+
+            bool collideLv2 =
+            b1.min.x <= b2.max.x &&
+            b1.max.x >= b2.min.x &&
+            b1.min.y <= b2.max.y &&
+            b1.max.y >= b2.min.y &&
+            b1.min.z <= b2.max.z &&
+            b1.max.z >= b2.min.z;
+
+            if(collideLv2)
+            {
+                if(debug)
+                {            
+                    collisionResults[i1] = 1;
+                    collisionResults[i2] = 1;
+                }
+            }
+        }
+    }
+
+    
+}
+
